@@ -1,0 +1,23 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+web/.next/
+web/out/
+
+# Python
+__pycache__/
+*.pyc
+ingest/.venv/
+ingest/__pycache__/
+*.egg-info/
+
+# Data (don't commit StatsBomb JSONs)
+data/
+
+# OS
+.DS_Store
+Thumbs.db

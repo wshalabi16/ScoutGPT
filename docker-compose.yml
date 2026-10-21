@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: scout
+      POSTGRES_PASSWORD: scout
+      POSTGRES_DB: scoutgpt
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scout -d scoutgpt"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: ./web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Read-only connection used by the SQL query tool
+      DATABASE_URL: postgresql://scout_readonly:readonly@db:5432/scoutgpt
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
