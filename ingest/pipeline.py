@@ -405,7 +405,12 @@ def aggregate_player_stats(conn: psycopg.Connection, competition_id: int, season
 # ─────────────────────────────────────────────────────────────────
 
 
-def run_ingest(competition_id: int, season_id: int, embed: bool = True) -> dict:
+def run_ingest(
+    competition_id: int,
+    season_id: int,
+    embed: bool = True,
+    max_matches: int | None = None,
+) -> dict:
     print("Connecting to database…")
     conn = get_conn()
 
@@ -415,6 +420,9 @@ def run_ingest(competition_id: int, season_id: int, embed: bool = True) -> dict:
     print("Loading matches…")
     matches = load_matches(conn, competition_id, season_id)
     print(f"  {len(matches)} matches found.")
+    if max_matches is not None:
+        matches = matches[:max_matches]
+        print(f"  Limiting event load to {len(matches)} match(es).")
 
     print("Loading events (this takes a few minutes)…")
     for m in tqdm(matches):
@@ -442,5 +450,11 @@ if __name__ == "__main__":
     parser.add_argument("--competition_id", type=int, required=True)
     parser.add_argument("--season_id", type=int, required=True)
     parser.add_argument("--no-embed", action="store_true")
+    parser.add_argument("--max-matches", type=int, default=None)
     args = parser.parse_args()
-    run_ingest(args.competition_id, args.season_id, embed=not args.no_embed)
+    run_ingest(
+        args.competition_id,
+        args.season_id,
+        embed=not args.no_embed,
+        max_matches=args.max_matches,
+    )
