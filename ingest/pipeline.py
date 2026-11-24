@@ -18,14 +18,21 @@ Usage as a CLI:
 import argparse
 import math
 import os
+import warnings
+from collections import defaultdict
 
+import numpy as np
 import psycopg
 import psycopg.types.json
 from dotenv import load_dotenv
+from minutes import compute_appearances, seconds_played
 from statsbombpy import sb
 from tqdm import tqdm
 
 load_dotenv()  # must run before any os.environ reads, including embeddings.py
+
+# statsbombpy warns on every request when no paid-API credentials are set; open data is intended.
+warnings.filterwarnings("ignore", message="credentials were not supplied")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
@@ -51,26 +58,37 @@ def _nan_to_none(v):
     return v
 
 
+def _json_safe(v):
+    """
+    Recursively convert a value into valid JSON, or None if it is missing.
+    NaN/inf are not valid JSON, so they become None at any depth.
+    """
+    if isinstance(v, np.generic):
+        v = v.item()
+    if v is None:
+        return None
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, dict):
+        cleaned = {str(k): _json_safe(x) for k, x in v.items()}
+        return {k: x for k, x in cleaned.items() if x is not None}
+    if isinstance(v, (list, tuple, np.ndarray)):
+        # Keep None in place so positional lists like [x, y, z] stay aligned.
+        return [_json_safe(x) for x in v]
+    return str(v)
+
+
 def _clean_extra(row, skip: set) -> dict:
-    """
-    Build the JSONB extra dict from a flattened events row.
-    Drops columns in `skip`, drops None and NaN values, and converts
-    any remaining non-JSON-serialisable types to strings so psycopg
-    never sees invalid JSON.
-    """
+    """Build the JSONB extra dict from a flattened events row, minus `skip` columns."""
     result = {}
     for k, v in row.items():
         if k in skip:
             continue
-        v = _nan_to_none(v)
-        if v is None:
-            continue
-        # Lists (e.g. pass_end_location) are fine; dicts shouldn't appear in
-        # the flattened frame but guard anyway.
-        if isinstance(v, (bool, int, float, str, list)):
-            result[k] = v
-        else:
-            result[k] = str(v)
+        cleaned = _json_safe(v)
+        if cleaned is not None:
+            result[k] = cleaned
     return result
 
 
@@ -224,7 +242,18 @@ def load_events_for_match(conn: psycopg.Connection, match_id: int):
                      minute, second, type, player_id, team_id,
                      location_x, location_y, extra)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (event_id) DO NOTHING
+                ON CONFLICT (event_id) DO UPDATE SET
+                    index      = EXCLUDED.index,
+                    period     = EXCLUDED.period,
+                    timestamp  = EXCLUDED.timestamp,
+                    minute     = EXCLUDED.minute,
+                    second     = EXCLUDED.second,
+                    type       = EXCLUDED.type,
+                    player_id  = EXCLUDED.player_id,
+                    team_id    = EXCLUDED.team_id,
+                    location_x = EXCLUDED.location_x,
+                    location_y = EXCLUDED.location_y,
+                    extra      = EXCLUDED.extra
                 """,
                 (
                     str(e["id"]),
@@ -243,6 +272,76 @@ def load_events_for_match(conn: psycopg.Connection, match_id: int):
                 ),
             )
     conn.commit()
+
+
+def _upsert_minutes(cur, competition_id: int, season_id: int):
+    """
+    Create a player_match_stats row for every appearance (from lineups and
+    substitutions, so players with no on-ball events are included) and set
+    minutes_played using the elapsed-time model in minutes.py.
+    """
+    scope = """
+        FROM events e
+        JOIN matches m ON m.match_id = e.match_id
+        WHERE m.competition_id = %(comp)s AND m.season_id = %(season)s
+    """
+    params = {"comp": competition_id, "season": season_id}
+
+    cur.execute(
+        f"""
+        SELECT e.match_id, e.period, MAX(EXTRACT(EPOCH FROM e.timestamp))::float
+        {scope}
+        GROUP BY e.match_id, e.period
+        """,
+        params,
+    )
+    period_lengths: dict[int, dict[int, float]] = defaultdict(dict)
+    for match_id, period, length in cur.fetchall():
+        period_lengths[match_id][period] = length
+
+    cur.execute(
+        f"""
+        SELECT e.match_id, e.period, EXTRACT(EPOCH FROM e.timestamp)::float,
+               e.type, e.player_id, e.team_id, e.extra
+        {scope}
+          AND (e.type IN ('Starting XI', 'Substitution', 'Player Off', 'Player On')
+               OR e.extra ? 'foul_committed_card'
+               OR e.extra ? 'bad_behaviour_card')
+        ORDER BY e.match_id, e.index
+        """,
+        params,
+    )
+    events_by_match: dict[int, list[dict]] = defaultdict(list)
+    for match_id, period, t, type_, player_id, team_id, extra in cur.fetchall():
+        events_by_match[match_id].append({
+            "period": period, "t": t, "type": type_,
+            "player_id": player_id, "team_id": team_id, "extra": extra,
+        })
+
+    players, rows = [], []
+    for match_id, events in events_by_match.items():
+        for app in compute_appearances(events, period_lengths[match_id]):
+            players.append((app.player_id, app.player_name))
+            rows.append((app.player_id, match_id, app.team_id, round(seconds_played(app) / 60, 2)))
+
+    cur.executemany(
+        """
+        INSERT INTO players (player_id, player_name) VALUES (%s, %s)
+        ON CONFLICT (player_id) DO UPDATE
+            SET player_name = EXCLUDED.player_name
+            WHERE players.player_name = ''
+        """,
+        players,
+    )
+    cur.executemany(
+        """
+        INSERT INTO player_match_stats (player_id, match_id, team_id, minutes_played)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (player_id, match_id) DO UPDATE
+            SET minutes_played = EXCLUDED.minutes_played
+        """,
+        rows,
+    )
 
 
 def aggregate_player_stats(conn: psycopg.Connection, competition_id: int, season_id: int):
@@ -350,11 +449,13 @@ def aggregate_player_stats(conn: psycopg.Connection, competition_id: int, season
             (competition_id, season_id),
         )
 
+        _upsert_minutes(cur, competition_id, season_id)
+
         cur.execute(
             """
             INSERT INTO player_tournament_stats
                 (player_id, competition_id, season_id, team_id,
-                 matches_played, shots, shots_on_target, goals, xg,
+                 matches_played, minutes_played, shots, shots_on_target, goals, xg,
                  passes_attempted, passes_completed, key_passes,
                  dribbles_attempted, dribbles_completed,
                  pressures, tackles, interceptions)
@@ -364,6 +465,7 @@ def aggregate_player_stats(conn: psycopg.Connection, competition_id: int, season
                 m.season_id,
                 pms.team_id,
                 COUNT(DISTINCT pms.match_id)     AS matches_played,
+                SUM(pms.minutes_played)          AS minutes_played,
                 SUM(pms.shots)                   AS shots,
                 SUM(pms.shots_on_target)         AS shots_on_target,
                 SUM(pms.goals)                   AS goals,
@@ -382,6 +484,7 @@ def aggregate_player_stats(conn: psycopg.Connection, competition_id: int, season
             GROUP BY pms.player_id, m.competition_id, m.season_id, pms.team_id
             ON CONFLICT (player_id, competition_id, season_id) DO UPDATE SET
                 matches_played     = EXCLUDED.matches_played,
+                minutes_played     = EXCLUDED.minutes_played,
                 shots              = EXCLUDED.shots,
                 shots_on_target    = EXCLUDED.shots_on_target,
                 goals              = EXCLUDED.goals,

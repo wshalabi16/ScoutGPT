@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS player_match_stats (
     player_id          INTEGER REFERENCES players(player_id),
     match_id           INTEGER REFERENCES matches(match_id),
     team_id            INTEGER REFERENCES teams(team_id),
-    minutes_played     INTEGER DEFAULT 0,
+    minutes_played     NUMERIC(7,2) DEFAULT 0,  -- elapsed playing time incl. stoppage, excl. breaks and shootout
     shots              INTEGER DEFAULT 0,
     shots_on_target    INTEGER DEFAULT 0,
     goals              INTEGER DEFAULT 0,
@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS player_tournament_stats (
     season_id          INTEGER REFERENCES seasons(season_id),
     team_id            INTEGER REFERENCES teams(team_id),
     matches_played     INTEGER DEFAULT 0,
-    minutes_played     INTEGER DEFAULT 0,
+    minutes_played     NUMERIC(7,2) DEFAULT 0,  -- elapsed playing time incl. stoppage, excl. breaks and shootout
     shots              INTEGER DEFAULT 0,
     shots_on_target    INTEGER DEFAULT 0,
     goals              INTEGER DEFAULT 0,
